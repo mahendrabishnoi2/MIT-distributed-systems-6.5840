@@ -460,6 +460,11 @@ func (rf *Raft) transitionToLeader() {
 	go rf.syncFollowers()
 }
 
+func wgDoneChan(wg *sync.WaitGroup, x chan struct{}) {
+	wg.Wait()
+	x <- struct{}{}
+}
+
 func (rf *Raft) syncFollowers() {
 	DPrintf("leader %d: syncing followers", rf.me)
 	defer func() {
@@ -474,6 +479,7 @@ func (rf *Raft) syncFollowers() {
 		}
 		rf.mu.Unlock()
 
+		var wg sync.WaitGroup
 		for i := range rf.peers {
 			if i == rf.me {
 				continue
@@ -502,56 +508,69 @@ func (rf *Raft) syncFollowers() {
 			}
 			var reply AppendEntriesReply
 			rf.mu.Unlock()
-			if !rf.sendAppendEntries(i, &args, &reply) {
-				continue
-			}
 
-			DPrintf("leader %d: response from peer: %d: %+v", rf.me, i, reply)
-			rf.mu.Lock()
-			// is it possible that the node is not even leader anymore?
-			if reply.Term > rf.currentTerm {
-				rf.state = Follower
-				rf.currentTerm = reply.Term
-				rf.votedFor = nil
-				rf.mu.Unlock()
-				return
-			}
+			// run these rpcs in parallel and in goroutines so that in case of partition these are non blocking
+			wg.Add(1)
+			go func(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+				defer wg.Done()
 
-			if reply.Success {
-				for j := 0; j < len(logsToSend); j++ {
-					rf.numReplicas[peerProgress.nextIndex+j]++
+				if !rf.sendAppendEntries(server, args, reply) {
+					return
+				}
 
-					if rf.commitIndex < peerProgress.nextIndex+j {
-						if rf.numReplicas[peerProgress.nextIndex+j] >= (len(rf.peers)/2)+1 { // quorum achieved
-							rf.commitIndex = peerProgress.nextIndex + j
+				DPrintf("leader %d: response from peer: %d: %+v", rf.me, server, reply)
+				rf.mu.Lock()
+				// is it possible that the node is not even leader anymore?
+				if reply.Term > rf.currentTerm {
+					rf.state = Follower
+					rf.currentTerm = reply.Term
+					rf.votedFor = nil
+					rf.mu.Unlock()
+					return
+				}
 
-							applyChMsg := raftapi.ApplyMsg{
-								CommandValid:  true,
-								Command:       rf.logs[rf.commitIndex].Command.Data,
-								CommandIndex:  rf.commitIndex,
-								SnapshotValid: false,
-								Snapshot:      []byte{},
-								SnapshotTerm:  0,
-								SnapshotIndex: i,
+				if reply.Success {
+					for j := 0; j < len(logsToSend); j++ {
+						rf.numReplicas[peerProgress.nextIndex+j]++
+
+						if rf.commitIndex < peerProgress.nextIndex+j {
+							if rf.numReplicas[peerProgress.nextIndex+j] >= (len(rf.peers)/2)+1 { // quorum achieved
+								rf.commitIndex = peerProgress.nextIndex + j
+
+								applyChMsg := raftapi.ApplyMsg{
+									CommandValid:  true,
+									Command:       rf.logs[rf.commitIndex].Command.Data,
+									CommandIndex:  rf.commitIndex,
+									SnapshotValid: false,
+									Snapshot:      []byte{},
+									SnapshotTerm:  0,
+									SnapshotIndex: i,
+								}
+								rf.applyCh <- applyChMsg
+
+								DPrintf("leader %d: sent applych msg: %+v", rf.me, applyChMsg)
 							}
-							rf.applyCh <- applyChMsg
-
-							DPrintf("leader %d: sent applych msg: %+v", rf.me, applyChMsg)
 						}
 					}
+					// all logsToSend applied, increment progress for the peer
+					rf.peerProgress[server] = progress{
+						nextIndex:  rf.peerProgress[server].nextIndex + len(logsToSend),
+						matchIndex: rf.peerProgress[server].nextIndex + len(logsToSend) - 1,
+					}
+				} else {
+					rf.peerProgress[server] = progress{
+						nextIndex: peerProgress.nextIndex - len(logsToSend),
+					}
 				}
-				// all logsToSend applied, increment progress for the peer
-				rf.peerProgress[i] = progress{
-					nextIndex:  rf.peerProgress[i].nextIndex + len(logsToSend),
-					matchIndex: rf.peerProgress[i].nextIndex + len(logsToSend) - 1,
-				}
-			} else {
-				rf.peerProgress[i] = progress{
-					nextIndex: peerProgress.nextIndex - len(logsToSend),
-				}
-			}
-			rf.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
+				rf.mu.Unlock()
+			}(i, &args, &reply)
+		}
+		wgDCh := make(chan struct{})
+		go wgDoneChan(&wg, wgDCh)
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-wgDCh:
+		case <-timer.C:
 		}
 	}
 }
