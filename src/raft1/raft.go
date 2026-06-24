@@ -325,7 +325,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := len(rf.logs)
 	term := rf.currentTerm
 
-	DPrintf("peer %d: received a commnd: %v", rf.me, command)
+	DPrintf("leader %d: received a commnd: %v", rf.me, command)
 	// Your code here (3B).
 	//
 	// in background send AppendRPC to all peers
@@ -339,6 +339,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.logs = append(rf.logs, logEntry)
 	rf.lastApplied++
+	rf.numReplicas[index]++
 
 	return index, term, true
 }
@@ -520,21 +521,23 @@ func (rf *Raft) syncFollowers() {
 				for j := 0; j < len(logsToSend); j++ {
 					rf.numReplicas[peerProgress.nextIndex+j]++
 
-					if rf.numReplicas[peerProgress.nextIndex+j] >= (len(rf.peers)/2)+1 { // quorum achieved
-						rf.commitIndex = peerProgress.nextIndex + j
+					if rf.commitIndex < peerProgress.nextIndex+j {
+						if rf.numReplicas[peerProgress.nextIndex+j] >= (len(rf.peers)/2)+1 { // quorum achieved
+							rf.commitIndex = peerProgress.nextIndex + j
 
-						applyChMsg := raftapi.ApplyMsg{
-							CommandValid:  true,
-							Command:       rf.logs[rf.commitIndex].Command.Data,
-							CommandIndex:  rf.commitIndex,
-							SnapshotValid: false,
-							Snapshot:      []byte{},
-							SnapshotTerm:  0,
-							SnapshotIndex: i,
+							applyChMsg := raftapi.ApplyMsg{
+								CommandValid:  true,
+								Command:       rf.logs[rf.commitIndex].Command.Data,
+								CommandIndex:  rf.commitIndex,
+								SnapshotValid: false,
+								Snapshot:      []byte{},
+								SnapshotTerm:  0,
+								SnapshotIndex: i,
+							}
+							rf.applyCh <- applyChMsg
+
+							DPrintf("leader %d: sent applych msg: %+v", rf.me, applyChMsg)
 						}
-						rf.applyCh <- applyChMsg
-
-						DPrintf("sent applych msg: %+v", applyChMsg)
 					}
 				}
 				// all logsToSend applied, increment progress for the peer
