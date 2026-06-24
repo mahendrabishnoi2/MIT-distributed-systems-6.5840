@@ -249,6 +249,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logs = append(rf.logs, args.Entries[j])
 		rf.lastApplied++
 	}
+	rf.lastApplied = len(rf.logs) - 1
 
 	// DPrintf("peer %d: applied log entries, %+v", rf.me, reply)
 
@@ -563,7 +564,7 @@ func (rf *Raft) syncFollowers() {
 					}
 				} else {
 					rf.peerProgress[server] = progress{
-						nextIndex: min(1, peerProgress.nextIndex-len(logsToSend)),
+						nextIndex: max(1, peerProgress.nextIndex-len(logsToSend)),
 					}
 					DPrintf("leader %d: updated progress for peer %d, %+v", rf.me, server, rf.peerProgress[server])
 				}
