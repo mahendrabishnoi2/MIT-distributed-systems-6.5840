@@ -219,44 +219,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// based on leader commit index, we commit our entries also
 
-	// do we have the log just before 1st entry?
-	if len(rf.logs) < args.PrevLogIndex {
+	// do we have the log just before 1st entry (PrevLogIndex)?
+	if len(rf.logs) <= args.PrevLogIndex {
 		return
 	}
-	// do the terms match for leader and peer/follower (for the log just before 1st entry) - if yes, we can commit it
-	if args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm { // term didn't match for previous log
+	// do the terms match for leader and follower (for the log just before 1st entry) - if yes, we can commit it
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm { // term didn't match for previous log
 		return
 	}
 
-	logIndex := args.PrevLogIndex
-	i := 0 // logIndex + i -> first new entry to add
-	for ; i < len(args.Entries); i++ {
+	for i := 1; i <= len(args.Entries); i++ {
 		// does log exists and does term match
-		if logIndex+i >= len(rf.logs) {
+		if args.PrevLogIndex+i >= len(rf.logs) {
 			break
 		}
-		if rf.logs[i+logIndex].Term == args.Entries[i].Term {
+		if rf.logs[i+args.PrevLogIndex].Term == args.Entries[i-1].Term {
 			continue
 		}
-		rf.logs = rf.logs[:i+logIndex] // only keep log till the terms are same with new entries
+		// if we are here, it means that at index args.PrevLogIndex + i, the term didn't match with leader so delete entries starting with it (or only keep till it)
+		rf.logs = rf.logs[:i+args.PrevLogIndex] // only keep log till the terms are same with new entries
 		break
 	}
 
 	// add new entries in the logs
-	for j := i; j < len(args.Entries); j++ {
+	for j := (len(rf.logs) - 1) - args.PrevLogIndex; j < len(args.Entries); j++ {
 		rf.logs = append(rf.logs, args.Entries[j])
 	}
 
-	if args.LeaderCommitIndex > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommitIndex, args.PrevLogIndex+len(args.Entries))
-	}
-	reply.Success = true
 	// DPrintf("peer %d: applied log entries, %+v", rf.me, reply)
 
 	// commit from rf.commitIndex till args.LeaderCommitIndex
-	for i := rf.commitIndex; i < args.LeaderCommitIndex && i < len(rf.logs); i++ {
-		// commit log at index i (0 based here)
-
+	for i := rf.commitIndex + 1; i <= args.LeaderCommitIndex && i < len(rf.logs); i++ {
 		applyChanMsg := raftapi.ApplyMsg{
 			CommandValid:  true,
 			Command:       rf.logs[i].Command.Data,
@@ -269,7 +262,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyCh <- applyChanMsg
 		DPrintf("peer %d: committed a message: %+v", rf.me, applyChanMsg)
 	}
-	rf.commitIndex = min(args.LeaderCommitIndex, len(rf.logs))
+	reply.Success = true
+	rf.commitIndex = min(args.LeaderCommitIndex, len(rf.logs)-1)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -344,6 +338,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: RaftCommand{command},
 	}
 	rf.logs = append(rf.logs, logEntry)
+	rf.lastApplied++
 
 	return index, term, true
 }
@@ -454,8 +449,8 @@ func (rf *Raft) transitionToLeader() {
 			nextIndex:  rf.lastApplied + 1,
 			matchIndex: 0,
 		}
-		DPrintf("leader %d: progress: %+v", rf.me, rf.peerProgress)
 	}
+	DPrintf("leader %d: progress: %+v", rf.me, rf.peerProgress)
 
 	rf.numReplicas = make(map[int]int)
 
@@ -488,19 +483,19 @@ func (rf *Raft) syncFollowers() {
 			peerProgress := rf.peerProgress[i]
 			logsToSend := []LogEntry{}
 
-			if len(rf.logs) < peerProgress.nextIndex { // do we have anything to send or not
+			if len(rf.logs) <= peerProgress.nextIndex { // do we have anything to send or not
 				rf.mu.Unlock()
 				continue
 			}
 			// we have something to send to this peer
 			// send only 1 for now
 			DPrintf("leader %d: sending logs to follower %d: progress: %+v", rf.me, i, peerProgress)
-			logsToSend = append(logsToSend, rf.logs[peerProgress.nextIndex-1])
+			logsToSend = append(logsToSend, rf.logs[peerProgress.nextIndex])
 			args := AppendEntriesArgs{
 				Term:              rf.currentTerm,
 				LeaderId:          rf.me,
 				PrevLogIndex:      peerProgress.nextIndex - 1,
-				PrevLogTerm:       term(rf.logs, peerProgress.nextIndex-1),
+				PrevLogTerm:       rf.logs[peerProgress.nextIndex-1].Term,
 				Entries:           logsToSend,
 				LeaderCommitIndex: rf.commitIndex,
 			}
@@ -530,8 +525,8 @@ func (rf *Raft) syncFollowers() {
 
 						applyChMsg := raftapi.ApplyMsg{
 							CommandValid:  true,
-							Command:       rf.logs[rf.commitIndex-1].Command.Data,
-							CommandIndex:  rf.commitIndex - 1,
+							Command:       rf.logs[rf.commitIndex].Command.Data,
+							CommandIndex:  rf.commitIndex,
 							SnapshotValid: false,
 							Snapshot:      []byte{},
 							SnapshotTerm:  0,
@@ -573,10 +568,7 @@ func (rf *Raft) sendHeartBeats() {
 			return
 		}
 
-		lastLogTerm := 0
-		if len(rf.logs) > 0 {
-			lastLogTerm = rf.logs[len(rf.logs)-1].Term
-		}
+		lastLogTerm := rf.logs[len(rf.logs)-1].Term
 		args := AppendEntriesArgs{
 			Term:              rf.currentTerm,
 			LeaderId:          rf.me,
