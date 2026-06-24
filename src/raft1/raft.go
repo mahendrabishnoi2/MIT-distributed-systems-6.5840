@@ -497,8 +497,11 @@ func (rf *Raft) syncFollowers() {
 			}
 			// we have something to send to this peer
 			// send only 1 for now
-			DPrintf("leader %d: sending logs to follower %d: progress: %+v", rf.me, i, peerProgress)
-			logsToSend = append(logsToSend, rf.logs[peerProgress.nextIndex])
+			n := min(10, len(rf.logs)-peerProgress.nextIndex)
+			for x := range n {
+				logsToSend = append(logsToSend, rf.logs[peerProgress.nextIndex+x])
+			}
+			DPrintf("leader %d: sending logs to follower %d: progress: %+v, num_logs:%d", rf.me, i, peerProgress, len(logsToSend))
 			args := AppendEntriesArgs{
 				Term:              rf.currentTerm,
 				LeaderId:          rf.me,
@@ -560,8 +563,9 @@ func (rf *Raft) syncFollowers() {
 					}
 				} else {
 					rf.peerProgress[server] = progress{
-						nextIndex: peerProgress.nextIndex - len(logsToSend),
+						nextIndex: min(1, peerProgress.nextIndex-len(logsToSend)),
 					}
+					DPrintf("leader %d: updated progress for peer %d, %+v", rf.me, server, rf.peerProgress[server])
 				}
 				rf.mu.Unlock()
 			}(i, &args, &reply)
