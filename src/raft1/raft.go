@@ -168,6 +168,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if args.Term > rf.currentTerm {
+		if rf.lastApplied > args.LastLogIndex || rf.logs[rf.lastApplied].Term > args.LastLogTerm {
+			return
+		}
 		rf.currentTerm = args.Term
 		reply.VoteGranted = true
 		rf.votedFor = &args.CandidateID
@@ -386,11 +389,8 @@ func (rf *Raft) ticker() {
 		rf.currentTerm++
 
 		term := rf.currentTerm
-		lastLogTerm := 0
-		if len(rf.logs) > 0 {
-			lastLogTerm = rf.logs[len(rf.logs)-1].Term
-		}
-		lastLogIndex := len(rf.logs) - 1
+		lastLogTerm := rf.logs[rf.lastApplied].Term
+		lastLogIndex := rf.lastApplied
 		rf.mu.Unlock()
 
 		var votesReceived atomic.Int32
