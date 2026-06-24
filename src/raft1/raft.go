@@ -162,7 +162,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		reply.VoteGranted = true
-		rf.votedFor = nil
+		rf.votedFor = &args.CandidateID
 		rf.state = Follower
 		return
 	}
@@ -204,6 +204,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
+	rf.state = Follower
+	rf.currentTerm = args.Term
+	rf.votedFor = nil
 	rf.lastHeartbeatAt = time.Now()
 }
 
@@ -259,7 +262,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
+	rf.mu.Lock()
 	isLeader := rf.state == Leader
+	rf.mu.Unlock()
 
 	if !isLeader {
 		return index, term, false
@@ -309,13 +314,13 @@ func (rf *Raft) ticker() {
 		rf.state = Candidate
 		rf.votedFor = &rf.me
 		rf.currentTerm++
-		rf.lastHeartbeatAt = time.Now()
 
 		term := rf.currentTerm
 		lastLogTerm := 0
 		if len(rf.logs) > 0 {
 			lastLogTerm = rf.logs[len(rf.logs)-1].Term
 		}
+		lastLogIndex := len(rf.logs) - 1
 		rf.mu.Unlock()
 
 		var votesReceived atomic.Int32
@@ -352,7 +357,7 @@ func (rf *Raft) ticker() {
 						rf.mu.Unlock()
 					}
 				}
-			}(i, term, lastLogTerm, len(rf.logs)-1)
+			}(i, term, lastLogTerm, lastLogIndex)
 		}
 	}
 }
@@ -397,12 +402,13 @@ func (rf *Raft) sendHeartBeats() {
 				if !rf.sendAppendEntries(server, &args, &reply) {
 					return
 				}
-				// todo: for next labs, reply.Success
+				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.state = Follower
 					rf.currentTerm = reply.Term
 					rf.votedFor = nil
 				}
+				rf.mu.Unlock()
 			}(i)
 		}
 
