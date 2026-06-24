@@ -244,6 +244,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// add new entries in the logs
 	for j := (len(rf.logs) - 1) - args.PrevLogIndex; j < len(args.Entries); j++ {
 		rf.logs = append(rf.logs, args.Entries[j])
+		rf.lastApplied++
 	}
 
 	// DPrintf("peer %d: applied log entries, %+v", rf.me, reply)
