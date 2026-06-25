@@ -158,24 +158,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("peer %d: received RequestVote RPC from peer %d, args: %+v", rf.me, args.CandidateID, *args)
-	defer DPrintf("peer %d: RequestVote RPC result to peer %d: %+v", rf.me, args.CandidateID, *reply)
+	DPrintf("peer %d: (term: %d, lastLogTerm: %d, lastLogIndex: %d) received RequestVote RPC from peer %d, args: %+v", rf.me, rf.currentTerm, rf.logs[rf.lastApplied].Term, rf.lastApplied, args.CandidateID, *args)
+	defer func() { DPrintf("peer %d: RequestVote RPC result to peer %d: %+v", rf.me, args.CandidateID, *reply) }()
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
 	}
 
+	rf.convertToFollower()
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = nil
 	}
 	reply.Term = rf.currentTerm
 	if !rf.isCandidateLogUpToDate(args.LastLogTerm, args.LastLogIndex) {
+		DPrintf("peer %d log more up to date than candidate %d", rf.me, args.CandidateID)
 		return
 	}
 
-	rf.convertToFollower()
 	if rf.votedFor == nil || rf.votedFor == &args.CandidateID {
 		reply.VoteGranted = true
 		rf.votedFor = &args.CandidateID
@@ -197,6 +198,9 @@ func (rf *Raft) isCandidateLogUpToDate(cLogTerm, cLogIndex int) bool {
 	return true
 }
 
+// convertToFollower
+//
+// caller to make sure rf.mu is locked
 func (rf *Raft) convertToFollower() {
 	rf.state = Follower
 	// if we implement some channel based ops like stop heartbeat sync etc, do those here
@@ -263,6 +267,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logs = append(rf.logs, args.Entries[j])
 	}
 	rf.lastApplied = len(rf.logs) - 1
+	reply.Success = true
 
 	if len(args.Entries) > 0 {
 		DPrintf("peer %d: applied log entries, logs: %d, applied: %d, %+v", rf.me, len(rf.logs), rf.lastApplied, reply)
@@ -282,7 +287,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyCh <- applyChanMsg
 		DPrintf("peer %d: committed a message: %+v", rf.me, applyChanMsg)
 	}
-	reply.Success = true
 	rf.commitIndex = min(args.LeaderCommitIndex, len(rf.logs)-1)
 }
 
@@ -512,8 +516,11 @@ func (rf *Raft) syncFollowers() {
 				continue
 			}
 			// we have something to send to this peer
-			// send only 1 for now
 			n := min(10, len(rf.logs)-peerProgress.nextIndex)
+			if n == 0 && peerProgress.matchIndex != rf.commitIndex {
+				peerProgress.nextIndex--
+				n = 1
+			}
 			for x := range n {
 				logsToSend = append(logsToSend, rf.logs[peerProgress.nextIndex+x])
 			}
@@ -551,31 +558,32 @@ func (rf *Raft) syncFollowers() {
 
 				if reply.Success {
 					for j := 0; j < len(logsToSend); j++ {
-						rf.numReplicas[peerProgress.nextIndex+j]++
+						logIdx := peerProgress.nextIndex + j
+						rf.numReplicas[logIdx]++
 
-						if rf.commitIndex < peerProgress.nextIndex+j {
-							if rf.numReplicas[peerProgress.nextIndex+j] >= (len(rf.peers)/2)+1 { // quorum achieved
-								rf.commitIndex = peerProgress.nextIndex + j
-
-								applyChMsg := raftapi.ApplyMsg{
-									CommandValid:  true,
-									Command:       rf.logs[rf.commitIndex].Command.Data,
-									CommandIndex:  rf.commitIndex,
-									SnapshotValid: false,
-									Snapshot:      []byte{},
-									SnapshotTerm:  0,
-									SnapshotIndex: i,
+						if rf.commitIndex < logIdx && rf.logs[logIdx].Term == rf.currentTerm {
+							if rf.numReplicas[logIdx] >= (len(rf.peers)/2)+1 { // quorum achieved
+								for k := rf.commitIndex + 1; k <= logIdx; k++ {
+									applyChMsg := raftapi.ApplyMsg{
+										CommandValid:  true,
+										Command:       rf.logs[k].Command.Data,
+										CommandIndex:  k,
+										SnapshotValid: false,
+										Snapshot:      []byte{},
+										SnapshotTerm:  0,
+										SnapshotIndex: k,
+									}
+									rf.applyCh <- applyChMsg
+									DPrintf("leader %d: sent applych msg: %+v", rf.me, applyChMsg)
 								}
-								rf.applyCh <- applyChMsg
-
-								DPrintf("leader %d: sent applych msg: %+v", rf.me, applyChMsg)
+								rf.commitIndex = logIdx
 							}
 						}
 					}
 					// all logsToSend applied, increment progress for the peer
 					rf.peerProgress[server] = progress{
-						nextIndex:  rf.peerProgress[server].nextIndex + len(logsToSend),
-						matchIndex: rf.peerProgress[server].nextIndex + len(logsToSend) - 1,
+						nextIndex:  peerProgress.nextIndex + len(logsToSend),
+						matchIndex: peerProgress.nextIndex + len(logsToSend) - 1,
 					}
 				} else {
 					rf.peerProgress[server] = progress{
@@ -633,10 +641,12 @@ func (rf *Raft) sendHeartBeats() {
 					return
 				}
 				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					rf.state = Follower
-					rf.currentTerm = reply.Term
-					rf.votedFor = nil
+				if reply.Success != true {
+					if reply.Term > rf.currentTerm {
+						rf.state = Follower
+						rf.currentTerm = reply.Term
+						rf.votedFor = nil
+					}
 				}
 				rf.mu.Unlock()
 			}(i)
