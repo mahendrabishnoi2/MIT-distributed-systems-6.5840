@@ -553,29 +553,6 @@ func (rf *Raft) syncFollowers() {
 				}
 
 				if reply.Success {
-					// for j := 0; j < len(logsToSend); j++ {
-					// 	logIdx := peerProgress.nextIndex + j
-
-					// 	if rf.commitIndex < logIdx && rf.logs[logIdx].Term == rf.currentTerm {
-					// 		if true { // quorum achieved
-					// 			for k := rf.commitIndex + 1; k <= logIdx; k++ {
-					// 				applyChMsg := raftapi.ApplyMsg{
-					// 					CommandValid:  true,
-					// 					Command:       rf.logs[k].Command.Data,
-					// 					CommandIndex:  k,
-					// 					SnapshotValid: false,
-					// 					Snapshot:      []byte{},
-					// 					SnapshotTerm:  0,
-					// 					SnapshotIndex: k,
-					// 				}
-					// 				rf.applyCh <- applyChMsg
-					// 				DPrintf("leader %d: sent applych msg: %+v", rf.me, applyChMsg)
-					// 			}
-					// 			rf.commitIndex = logIdx
-					// 		}
-					// 	}
-					// }
-					// all logsToSend applied, increment progress for the peer
 					rf.peerProgress[server] = progress{
 						nextIndex:  peerProgress.nextIndex + len(logsToSend),
 						matchIndex: peerProgress.nextIndex + len(logsToSend) - 1,
@@ -632,13 +609,6 @@ func (rf *Raft) maybeAdvanceCommitIndex() {
 			break
 		}
 	}
-}
-
-func term(logs []LogEntry, idx int) int {
-	if idx == 0 {
-		return 0
-	}
-	return logs[idx-1].Term
 }
 
 func (rf *Raft) sendHeartBeats() {
