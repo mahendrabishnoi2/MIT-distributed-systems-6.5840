@@ -167,10 +167,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	rf.convertToFollower()
 	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
-		rf.votedFor = nil
+		rf.convertToFollower(args.Term)
 	}
 	reply.Term = rf.currentTerm
 	if !rf.isCandidateLogUpToDate(args.LastLogTerm, args.LastLogIndex) {
@@ -178,9 +176,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.votedFor == nil || rf.votedFor == &args.CandidateID {
+	if rf.votedFor == nil || *rf.votedFor == args.CandidateID {
 		reply.VoteGranted = true
 		rf.votedFor = &args.CandidateID
+		rf.lastHeartbeatAt = time.Now()
 	}
 }
 
@@ -202,10 +201,10 @@ func (rf *Raft) isCandidateLogUpToDate(cLogTerm, cLogIndex int) bool {
 // convertToFollower
 //
 // caller to make sure rf.mu is locked
-func (rf *Raft) convertToFollower() {
+func (rf *Raft) convertToFollower(term int) {
 	rf.state = Follower
-	// when stepping down, reset heartbeat so that we don't start election immediately
-	rf.lastHeartbeatAt = time.Now()
+	rf.currentTerm = term
+	rf.votedFor = nil
 }
 
 type AppendEntriesArgs struct {
@@ -226,19 +225,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("peer %d: received AppendEntries from peer %d, args: %+v", rf.me, args.LeaderId, *args)
-	reply.Term = rf.currentTerm
 	reply.Success = false
 
 	// todo: implementation for modifying log, not required for 3A tests
 	// 3A tests mainly focus on heartbeats and leader election
 	// heartbeats are not saved to log
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		return
 	}
-	rf.state = Follower
-	rf.currentTerm = args.Term
-	rf.votedFor = nil
+	if args.Term > rf.currentTerm || rf.state == Candidate {
+		rf.convertToFollower(args.Term)
+	}
 	rf.lastHeartbeatAt = time.Now()
+	reply.Term = rf.currentTerm
 
 	// based on leader commit index, we commit our entries also
 
@@ -275,7 +275,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// commit from rf.commitIndex till args.LeaderCommitIndex
-	rf.commitIndex = min(args.LeaderCommitIndex, rf.lastLogIndex())
+	rf.commitIndex = max(rf.commitIndex, min(args.LeaderCommitIndex, rf.lastLogIndex()))
 	if rf.lastApplied < rf.commitIndex {
 		rf.applierCond.Signal()
 	}
@@ -432,8 +432,7 @@ func (rf *Raft) ticker() {
 				} else {
 					if reply.Term > term {
 						rf.mu.Lock()
-						rf.currentTerm = reply.Term
-						rf.state = Follower
+						rf.convertToFollower(reply.Term)
 						rf.mu.Unlock()
 					}
 				}
@@ -444,7 +443,7 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) transitionToLeader() {
 	rf.mu.Lock()
-	if rf.state == Leader {
+	if rf.state != Candidate {
 		rf.mu.Unlock()
 		return
 	}
@@ -505,10 +504,10 @@ func (rf *Raft) syncFollowers() {
 			}
 			// we have something to send to this peer
 			n := min(10, len(rf.logs)-peerProgress.nextIndex)
-			if n == 0 && peerProgress.matchIndex != rf.commitIndex {
-				peerProgress.nextIndex--
-				n = 1
-			}
+			// if n == 0 && peerProgress.matchIndex != rf.commitIndex {
+			// 	peerProgress.nextIndex--
+			// 	n = 1
+			// }
 			for x := range n {
 				logsToSend = append(logsToSend, rf.logs[peerProgress.nextIndex+x])
 			}
@@ -540,6 +539,7 @@ func (rf *Raft) syncFollowers() {
 					rf.state = Follower
 					rf.currentTerm = reply.Term
 					rf.votedFor = nil
+					rf.lastHeartbeatAt = time.Now()
 					rf.mu.Unlock()
 					return
 				}
@@ -631,6 +631,12 @@ func (rf *Raft) sendHeartBeats() {
 						rf.state = Follower
 						rf.currentTerm = reply.Term
 						rf.votedFor = nil
+						rf.lastHeartbeatAt = time.Now()
+					} else {
+						p := rf.peerProgress[server]
+						rf.peerProgress[server] = progress{
+							nextIndex: max(1, p.nextIndex-1),
+						}
 					}
 				}
 				rf.mu.Unlock()
