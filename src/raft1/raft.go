@@ -155,37 +155,51 @@ type RequestVoteReply struct {
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("peer %d: received RequestVote RPC from peer %d, args: %+v", rf.me, args.CandidateID, *args)
-	// Your code here (3A, 3B).
-	defer func() {
-		DPrintf("peer %d: RequestVote RPC result to peer %d: %+v", rf.me, args.CandidateID, *reply)
-	}()
-	reply.Term = rf.currentTerm
+	defer DPrintf("peer %d: RequestVote RPC result to peer %d: %+v", rf.me, args.CandidateID, *reply)
+
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
 	}
-	if args.Term > rf.currentTerm {
-		if rf.lastApplied > args.LastLogIndex || rf.logs[rf.lastApplied].Term > args.LastLogTerm {
-			return
-		}
+
+	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
-		reply.VoteGranted = true
-		rf.votedFor = &args.CandidateID
-		rf.state = Follower
+		rf.votedFor = nil
+	}
+	reply.Term = rf.currentTerm
+	if !rf.isCandidateLogUpToDate(args.LastLogTerm, args.LastLogIndex) {
 		return
 	}
 
-	// same term as vote requetor
-	if len(rf.logs) >= args.LastLogIndex {
-		if rf.state == Leader {
-			return
-		}
+	rf.convertToFollower()
+	if rf.votedFor == nil || rf.votedFor == &args.CandidateID {
 		reply.VoteGranted = true
 		rf.votedFor = &args.CandidateID
 	}
+}
+
+// isCandidateLogUpToDate returns if candidate's last log term is higher than its own last log cLogTerm
+// If both have same last log term, then it returns true if its last log index is not greater than candidate.
+// This is useful in implementing Raft Election Restriction Property
+//
+// Note: This method should be called from within a lock (rf.mu)
+func (rf *Raft) isCandidateLogUpToDate(cLogTerm, cLogIndex int) bool {
+	if rf.logs[rf.lastApplied].Term > cLogTerm {
+		return false
+	}
+	if rf.logs[rf.lastApplied].Term == cLogTerm {
+		return rf.lastApplied <= cLogIndex
+	}
+	return true
+}
+
+func (rf *Raft) convertToFollower() {
+	rf.state = Follower
+	// if we implement some channel based ops like stop heartbeat sync etc, do those here
 }
 
 type AppendEntriesArgs struct {
@@ -247,11 +261,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// add new entries in the logs
 	for j := (len(rf.logs) - 1) - args.PrevLogIndex; j < len(args.Entries); j++ {
 		rf.logs = append(rf.logs, args.Entries[j])
-		rf.lastApplied++
 	}
 	rf.lastApplied = len(rf.logs) - 1
 
-	// DPrintf("peer %d: applied log entries, %+v", rf.me, reply)
+	if len(args.Entries) > 0 {
+		DPrintf("peer %d: applied log entries, logs: %d, applied: %d, %+v", rf.me, len(rf.logs), rf.lastApplied, reply)
+	}
 
 	// commit from rf.commitIndex till args.LeaderCommitIndex
 	for i := rf.commitIndex + 1; i <= args.LeaderCommitIndex && i < len(rf.logs); i++ {
