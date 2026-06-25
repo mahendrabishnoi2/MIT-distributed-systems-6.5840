@@ -65,7 +65,6 @@ type Raft struct {
 
 	// only for leader
 	peerProgress map[int]progress
-	numReplicas  map[int]int // log index -> num copies (how many nodes accepted this), maybe change to atomic int later
 
 	lastHeartbeatAt time.Time
 
@@ -363,7 +362,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.logs = append(rf.logs, logEntry)
 	rf.lastApplied++
-	rf.numReplicas[index]++
 
 	return index, term, true
 }
@@ -474,8 +472,6 @@ func (rf *Raft) transitionToLeader() {
 	}
 	DPrintf("leader %d: progress: %+v", rf.me, rf.peerProgress)
 
-	rf.numReplicas = make(map[int]int)
-
 	rf.mu.Unlock()
 	go rf.sendHeartBeats()
 	go rf.syncFollowers()
@@ -557,34 +553,34 @@ func (rf *Raft) syncFollowers() {
 				}
 
 				if reply.Success {
-					for j := 0; j < len(logsToSend); j++ {
-						logIdx := peerProgress.nextIndex + j
-						rf.numReplicas[logIdx]++
+					// for j := 0; j < len(logsToSend); j++ {
+					// 	logIdx := peerProgress.nextIndex + j
 
-						if rf.commitIndex < logIdx && rf.logs[logIdx].Term == rf.currentTerm {
-							if rf.numReplicas[logIdx] >= (len(rf.peers)/2)+1 { // quorum achieved
-								for k := rf.commitIndex + 1; k <= logIdx; k++ {
-									applyChMsg := raftapi.ApplyMsg{
-										CommandValid:  true,
-										Command:       rf.logs[k].Command.Data,
-										CommandIndex:  k,
-										SnapshotValid: false,
-										Snapshot:      []byte{},
-										SnapshotTerm:  0,
-										SnapshotIndex: k,
-									}
-									rf.applyCh <- applyChMsg
-									DPrintf("leader %d: sent applych msg: %+v", rf.me, applyChMsg)
-								}
-								rf.commitIndex = logIdx
-							}
-						}
-					}
+					// 	if rf.commitIndex < logIdx && rf.logs[logIdx].Term == rf.currentTerm {
+					// 		if true { // quorum achieved
+					// 			for k := rf.commitIndex + 1; k <= logIdx; k++ {
+					// 				applyChMsg := raftapi.ApplyMsg{
+					// 					CommandValid:  true,
+					// 					Command:       rf.logs[k].Command.Data,
+					// 					CommandIndex:  k,
+					// 					SnapshotValid: false,
+					// 					Snapshot:      []byte{},
+					// 					SnapshotTerm:  0,
+					// 					SnapshotIndex: k,
+					// 				}
+					// 				rf.applyCh <- applyChMsg
+					// 				DPrintf("leader %d: sent applych msg: %+v", rf.me, applyChMsg)
+					// 			}
+					// 			rf.commitIndex = logIdx
+					// 		}
+					// 	}
+					// }
 					// all logsToSend applied, increment progress for the peer
 					rf.peerProgress[server] = progress{
 						nextIndex:  peerProgress.nextIndex + len(logsToSend),
 						matchIndex: peerProgress.nextIndex + len(logsToSend) - 1,
 					}
+					rf.maybeAdvanceCommitIndex()
 				} else {
 					rf.peerProgress[server] = progress{
 						nextIndex: max(1, peerProgress.nextIndex-len(logsToSend)),
@@ -600,6 +596,40 @@ func (rf *Raft) syncFollowers() {
 		select {
 		case <-wgDCh:
 		case <-timer.C:
+		}
+	}
+}
+
+// maybeAdvanceCommitIndex
+// make sure rf.mu is held when this method is called
+func (rf *Raft) maybeAdvanceCommitIndex() {
+	// scan from most recent log till the first non committed log entry
+	for n := len(rf.logs) - 1; n > rf.commitIndex; n-- {
+		// with counting approach, leader can only decide for rf.currentTerm
+		if rf.logs[n].Term != rf.currentTerm {
+			continue // should we return or break here instead?
+		}
+
+		// count match index for peers
+		replicas := 1 // leader has this entry
+		for _, peerProgress := range rf.peerProgress {
+			if peerProgress.matchIndex >= n {
+				replicas++
+			}
+		}
+
+		if replicas >= (len(rf.peers)/2)+1 { // quorum
+			// from rf.commitIndex till n, we can commit
+			for k := rf.commitIndex + 1; k <= n; k++ {
+				applyMsg := raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[k].Command.Data,
+					CommandIndex: k,
+				}
+				rf.applyCh <- applyMsg
+			}
+			rf.commitIndex = n
+			break
 		}
 	}
 }
