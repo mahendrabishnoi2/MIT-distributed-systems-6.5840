@@ -204,7 +204,8 @@ func (rf *Raft) isCandidateLogUpToDate(cLogTerm, cLogIndex int) bool {
 // caller to make sure rf.mu is locked
 func (rf *Raft) convertToFollower() {
 	rf.state = Follower
-	// if we implement some channel based ops like stop heartbeat sync etc, do those here
+	// when stepping down, reset heartbeat so that we don't start election immediately
+	rf.lastHeartbeatAt = time.Now()
 }
 
 type AppendEntriesArgs struct {
@@ -381,7 +382,8 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 
 		// pause for a random amount of time between 50 and 350 milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		// make sure this is higher than heartbeat interval
+		ms := 150 + (rand.Int63() % 150)
 		electionTimeoutDuration := time.Duration(ms) * time.Millisecond
 		time.Sleep(electionTimeoutDuration)
 
