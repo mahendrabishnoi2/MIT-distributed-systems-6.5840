@@ -259,8 +259,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.logs[i+args.PrevLogIndex].Term == args.Entries[i-1].Term {
 			continue
 		}
-		// if we are here, it means that at index args.PrevLogIndex + i, the term didn't match with leader so delete entries starting with it (or only keep till it)
-		rf.logs = rf.logs[:i+args.PrevLogIndex] // only keep log till the terms are same with new entries
+		if i+args.PrevLogIndex <= rf.commitIndex {
+			return
+		}
+		rf.logs = rf.logs[:i+args.PrevLogIndex]
 		break
 	}
 
@@ -463,55 +465,43 @@ func (rf *Raft) transitionToLeader() {
 	}
 	DPrintf("leader %d: progress: %+v", rf.me, rf.peerProgress)
 
+	leaderTerm := rf.currentTerm
 	rf.mu.Unlock()
-	go rf.sendHeartBeats()
-	go rf.syncFollowers()
+	go rf.syncFollowers(leaderTerm)
 }
 
-func wgDoneChan(wg *sync.WaitGroup, x chan struct{}) {
-	wg.Wait()
-	x <- struct{}{}
-}
-
-func (rf *Raft) syncFollowers() {
+func (rf *Raft) syncFollowers(leaderTerm int) {
 	DPrintf("leader %d: syncing followers", rf.me)
 	defer func() {
 		DPrintf("leader %d: stop syncing followers", rf.me)
 	}()
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.state != Leader {
+		if rf.state != Leader || rf.currentTerm != leaderTerm {
 			DPrintf("peer %d: not a leader", rf.me)
 			rf.mu.Unlock()
 			return
 		}
 		rf.mu.Unlock()
 
-		var wg sync.WaitGroup
 		for i := range rf.peers {
 			if i == rf.me {
 				continue
 			}
 
 			rf.mu.Lock()
-			// determine what to send to a peer
 			peerProgress := rf.peerProgress[i]
 			logsToSend := []LogEntry{}
-
-			if len(rf.logs) <= peerProgress.nextIndex { // do we have anything to send or not
-				rf.mu.Unlock()
-				continue
-			}
-			// we have something to send to this peer
 			n := min(10, len(rf.logs)-peerProgress.nextIndex)
-			// if n == 0 && peerProgress.matchIndex != rf.commitIndex {
-			// 	peerProgress.nextIndex--
-			// 	n = 1
-			// }
+			if n < 0 {
+				n = 0
+			}
 			for x := range n {
 				logsToSend = append(logsToSend, rf.logs[peerProgress.nextIndex+x])
 			}
-			DPrintf("leader %d: sending logs to follower %d: progress: %+v, num_logs:%d", rf.me, i, peerProgress, len(logsToSend))
+			if len(logsToSend) > 0 {
+				DPrintf("leader %d: sending logs to follower %d: progress: %+v, num_logs:%d", rf.me, i, peerProgress, len(logsToSend))
+			}
 			args := AppendEntriesArgs{
 				Term:              rf.currentTerm,
 				LeaderId:          rf.me,
@@ -520,21 +510,16 @@ func (rf *Raft) syncFollowers() {
 				Entries:           logsToSend,
 				LeaderCommitIndex: rf.commitIndex,
 			}
-			var reply AppendEntriesReply
 			rf.mu.Unlock()
 
-			// run these rpcs in parallel and in goroutines so that in case of partition these are non blocking
-			wg.Add(1)
-			go func(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-				defer wg.Done()
-
-				if !rf.sendAppendEntries(server, args, reply) {
+			go func(server int, p progress, args AppendEntriesArgs) {
+				var reply AppendEntriesReply
+				if !rf.sendAppendEntries(server, &args, &reply) {
 					return
 				}
 
 				DPrintf("leader %d: response from peer: %d: %+v", rf.me, server, reply)
 				rf.mu.Lock()
-				// is it possible that the node is not even leader anymore?
 				if reply.Term > rf.currentTerm {
 					rf.state = Follower
 					rf.currentTerm = reply.Term
@@ -543,29 +528,33 @@ func (rf *Raft) syncFollowers() {
 					rf.mu.Unlock()
 					return
 				}
+				if args.Term != rf.currentTerm {
+					rf.mu.Unlock()
+					return
+				}
 
-				if reply.Success {
+				if reply.Success && len(args.Entries) > 0 {
 					rf.peerProgress[server] = progress{
-						nextIndex:  peerProgress.nextIndex + len(logsToSend),
-						matchIndex: peerProgress.nextIndex + len(logsToSend) - 1,
+						nextIndex:  p.nextIndex + len(args.Entries),
+						matchIndex: p.nextIndex + len(args.Entries) - 1,
 					}
 					rf.maybeAdvanceCommitIndex()
-				} else {
+				} else if !reply.Success && len(args.Entries) > 0 {
 					rf.peerProgress[server] = progress{
-						nextIndex: max(1, peerProgress.nextIndex-len(logsToSend)),
+						nextIndex: max(1, p.nextIndex-len(args.Entries)),
 					}
 					DPrintf("leader %d: updated progress for peer %d, %+v", rf.me, server, rf.peerProgress[server])
+				} else if !reply.Success {
+					// heartbeat failed: follower log is behind, back off nextIndex
+					rf.peerProgress[server] = progress{
+						nextIndex: max(1, p.nextIndex-1),
+					}
 				}
 				rf.mu.Unlock()
-			}(i, &args, &reply)
+			}(i, peerProgress, args)
 		}
-		wgDCh := make(chan struct{})
-		go wgDoneChan(&wg, wgDCh)
-		timer := time.NewTimer(50 * time.Millisecond)
-		select {
-		case <-wgDCh:
-		case <-timer.C:
-		}
+
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -596,56 +585,6 @@ func (rf *Raft) maybeAdvanceCommitIndex() {
 	}
 }
 
-func (rf *Raft) sendHeartBeats() {
-	for !rf.killed() {
-		rf.mu.Lock()
-		if rf.state != Leader {
-			rf.mu.Unlock()
-			return
-		}
-
-		lastLogTerm := rf.logs[rf.lastLogIndex()].Term
-		args := AppendEntriesArgs{
-			Term:              rf.currentTerm,
-			LeaderId:          rf.me,
-			PrevLogIndex:      rf.lastLogIndex(),
-			PrevLogTerm:       lastLogTerm,
-			Entries:           nil,
-			LeaderCommitIndex: rf.commitIndex,
-		}
-		rf.mu.Unlock()
-
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-
-			go func(server int) {
-				var reply AppendEntriesReply
-				if !rf.sendAppendEntries(server, &args, &reply) {
-					return
-				}
-				rf.mu.Lock()
-				if reply.Success != true {
-					if reply.Term > rf.currentTerm {
-						rf.state = Follower
-						rf.currentTerm = reply.Term
-						rf.votedFor = nil
-						rf.lastHeartbeatAt = time.Now()
-					} else {
-						p := rf.peerProgress[server]
-						rf.peerProgress[server] = progress{
-							nextIndex: max(1, p.nextIndex-1),
-						}
-					}
-				}
-				rf.mu.Unlock()
-			}(i)
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
 
 func (rf *Raft) applier() {
 	for !rf.killed() {
