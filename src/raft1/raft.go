@@ -155,6 +155,20 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+type AppendEntriesRequest struct {
+	Term              int
+	LeaderID          int
+	PrevLogIndex      int
+	PrevLogTerm       int
+	Entries           []LogEntry
+	LeaderCommitIndex int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
@@ -165,6 +179,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply:   ch,
 	}
 	*reply = (<-ch).(RequestVoteReply)
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesReply) {
+	ch := make(chan any, 1)
+	rf.events <- event{
+		kind:    evAppendEntries,
+		payload: args,
+		reply:   ch,
+	}
+	*reply = (<-ch).(AppendEntriesReply)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -195,7 +219,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	DPrintf("server %d: sending request vote to server %d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -260,6 +290,7 @@ func (rf *Raft) run() {
 }
 
 func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central entry point for raft state machine
+	DPrintf("server %d: received event kind: %v", rf.me, ev.kind)
 	switch ev.kind {
 	case evRequestVote:
 		args := ev.payload.(*RequestVoteArgs)
@@ -283,7 +314,8 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 
 		ev.reply <- reply
 	case evRequestVoteReply:
-		reply := ev.payload.(RequestVoteReply)
+		reply := ev.payload.(*RequestVoteReply)
+		DPrintf("server %d: request vote reply: %+v", rf.me, reply)
 		if reply.Term > rf.currentTerm {
 			rf.becomeFollower(reply.Term)
 			return
@@ -301,16 +333,19 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 
 func (rf *Raft) becomeFollower(term int) {
 	rf.state = Follower
+	DPrintf("server %d: becoming follower in term %d", rf.me, term)
 	rf.reset(term)
 }
 
 func (rf *Raft) becomeLeader() {
 	rf.state = Leader
+	DPrintf("server %d: becoming leader in term %d", rf.me, rf.currentTerm)
 	rf.reset(rf.currentTerm)
 }
 
 func (rf *Raft) becomeCandidate() {
 	rf.state = Candidate
+	DPrintf("server %d: becoming candidate in term %d", rf.me, rf.currentTerm+1)
 	rf.reset(rf.currentTerm + 1)
 	rf.votedFor = rf.me
 }
@@ -330,7 +365,6 @@ func (rf *Raft) handleTick() {
 		rf.electionElapsed++
 
 		if rf.heartbeatElapsed >= rf.heartbeatTimeout {
-
 			// todo: send heartbeats
 		}
 		return
@@ -341,10 +375,17 @@ func (rf *Raft) handleTick() {
 		return
 	}
 	rf.becomeCandidate()
-	rf.votes++ // for now, we are directly starting with vote = 1, maybe later send a vote on events channel
+	// rf.votes = 1 // for now, we are directly starting with vote = 1, maybe later send a vote on events channel
 
 	for i := range rf.peers {
 		if i == rf.me {
+			rf.events <- event{
+				kind: evRequestVoteReply,
+				payload: &RequestVoteReply{
+					Term:        rf.currentTerm,
+					VoteGranted: true,
+				},
+			}
 			continue
 		}
 		args := RequestVoteArgs{
@@ -359,7 +400,7 @@ func (rf *Raft) handleTick() {
 			if ok {
 				rf.events <- event{
 					kind:    evRequestVoteReply,
-					payload: reply,
+					payload: &reply,
 				}
 			}
 		}(i, args)
@@ -420,13 +461,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = nil
 	rf.matchIndex = nil
 
-	rf.tickDuration = time.Microsecond * 50
+	rf.tickDuration = time.Millisecond * 50
 	rf.heartbeatTimeout = 1
-	rf.electionTimeout = 5
+	rf.electionTimeout = 10
 
 	rf.randomizedElectionTimeout = rf.electionTimeout + rand.Intn(rf.electionTimeout)
 
-	rf.events = make(chan event)
+	rf.events = make(chan event, 64)
 	rf.tickCh = make(chan struct{})
 
 	// initialize from state persisted before a crash
