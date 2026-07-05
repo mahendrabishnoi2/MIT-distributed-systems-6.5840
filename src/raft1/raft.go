@@ -279,7 +279,7 @@ func (rf *Raft) ticker() {
 
 // run runs the event loop in a goroutine, processing events in a sequential order
 func (rf *Raft) run() {
-	for {
+	for !rf.killed() {
 		select {
 		case ev := <-rf.events:
 			rf.handleEvent(ev)
@@ -307,6 +307,7 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 			rf.becomeFollower(args.Term)
 		}
 
+		reply.Term = rf.currentTerm
 		if rf.votedFor == args.CandidateID || rf.votedFor == -1 {
 			rf.votedFor = args.CandidateID
 			reply.VoteGranted = true
@@ -320,7 +321,10 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 			rf.becomeFollower(reply.Term)
 			return
 		}
-		if reply.VoteGranted {
+		if rf.state != Candidate {
+			return
+		}
+		if reply.VoteGranted && reply.Term == rf.currentTerm {
 			rf.votes++
 		}
 		if rf.votes >= (len(rf.peers)/2)+1 {
@@ -477,8 +481,12 @@ func (rf *Raft) reset(term int) {
 	rf.electionElapsed = 0
 
 	rf.votes = 0
-
+	rf.randomizeElectionTimeout()
 	// todo: reset nextIndex and matchIndex as well
+}
+
+func (rf *Raft) randomizeElectionTimeout() {
+	rf.randomizedElectionTimeout = rf.electionTimeout + rand.Intn(rf.electionTimeout)
 }
 
 // the service or tester wants to create a Raft server. the ports
