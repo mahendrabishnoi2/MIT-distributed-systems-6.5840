@@ -290,7 +290,7 @@ func (rf *Raft) run() {
 }
 
 func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central entry point for raft state machine
-	DPrintf("server %d: received event kind: %v", rf.me, ev.kind)
+	// DPrintf("server %d: received event kind: %v", rf.me, ev.kind)
 	switch ev.kind {
 	case evRequestVote:
 		args := ev.payload.(*RequestVoteArgs)
@@ -331,17 +331,18 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 		var reply AppendEntriesReply
 		reply.Term = rf.currentTerm
 		if args.Term < rf.currentTerm {
-			reply.Success = false
 			ev.reply <- reply
 			return
 		}
 
-		if args.Term > rf.currentTerm {
+		if args.Term > rf.currentTerm || rf.state == Candidate {
 			rf.becomeFollower(args.Term)
 		}
+		rf.electionElapsed = 0
 
 		// todo: not handling log entry matching, conflicts, commit etc
-
+		reply.Success = true
+		ev.reply <- reply
 	case evAppendEntriesReply:
 		reply := ev.payload.(*AppendEntriesReply)
 		if reply.Term > rf.currentTerm {
