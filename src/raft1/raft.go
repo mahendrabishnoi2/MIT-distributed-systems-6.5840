@@ -326,6 +326,29 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 		if rf.votes >= (len(rf.peers)/2)+1 {
 			rf.becomeLeader()
 		}
+	case evAppendEntries:
+		args := ev.payload.(*AppendEntriesRequest)
+		var reply AppendEntriesReply
+		reply.Term = rf.currentTerm
+		if args.Term < rf.currentTerm {
+			reply.Success = false
+			ev.reply <- reply
+			return
+		}
+
+		if args.Term > rf.currentTerm {
+			rf.becomeFollower(args.Term)
+		}
+
+		// todo: not handling log entry matching, conflicts, commit etc
+
+	case evAppendEntriesReply:
+		reply := ev.payload.(*AppendEntriesReply)
+		if reply.Term > rf.currentTerm {
+			rf.becomeFollower(reply.Term)
+		}
+
+		// todo: based on reply.Success, adjust nextIndex and matchIndex
 	default:
 		panic("unexpected event kind")
 	}
@@ -359,13 +382,41 @@ func (rf *Raft) isAtLeastAsUpToDate(lastLogTerm, lastLogIndex int) bool {
 	return false
 }
 
+func (rf *Raft) buildHeartbeatArgs() AppendEntriesRequest {
+	return AppendEntriesRequest{
+		Term:              rf.currentTerm,
+		LeaderID:          rf.me,
+		PrevLogIndex:      rf.lastLogIndex(),
+		PrevLogTerm:       rf.lastLogTerm(),
+		Entries:           []LogEntry{},
+		LeaderCommitIndex: rf.commitIndex,
+	}
+}
+
 func (rf *Raft) handleTick() {
 	if rf.state == Leader {
 		rf.heartbeatElapsed++
 		rf.electionElapsed++
 
 		if rf.heartbeatElapsed >= rf.heartbeatTimeout {
-			// todo: send heartbeats
+			rf.heartbeatElapsed = 0
+
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				args := rf.buildHeartbeatArgs()
+				go func(server int, args AppendEntriesRequest) {
+					var reply AppendEntriesReply
+					ok := rf.sendAppendEntries(server, &args, &reply)
+					if ok {
+						rf.events <- event{
+							kind:    evAppendEntriesReply,
+							payload: &reply,
+						}
+					}
+				}(i, args)
+			}
 		}
 		return
 	}
