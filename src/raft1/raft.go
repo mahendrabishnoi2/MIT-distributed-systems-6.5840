@@ -73,14 +73,22 @@ type Raft struct {
 	votes int
 }
 
+type GetStateReply struct {
+	CurrentTerm int
+	State       State
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	// Your code here (3A).
-	return rf.currentTerm, rf.state == Leader
+	ch := make(chan any)
+	rf.events <- event{
+		kind:    evGetState,
+		payload: nil,
+		reply:   ch,
+	}
+	out := (<-ch).(*GetStateReply)
+	return out.CurrentTerm, out.State == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -292,6 +300,11 @@ func (rf *Raft) run() {
 func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central entry point for raft state machine
 	// DPrintf("server %d: received event kind: %v", rf.me, ev.kind)
 	switch ev.kind {
+	case evGetState:
+		ev.reply <- &GetStateReply{
+			CurrentTerm: rf.currentTerm,
+			State:       rf.state,
+		}
 	case evRequestVote:
 		args := ev.payload.(*RequestVoteArgs)
 		reply := RequestVoteReply{}

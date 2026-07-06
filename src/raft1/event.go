@@ -15,4 +15,5 @@ const (
 	evAppendEntriesReply
 	evStart
 	evTick
+	evGetState
 )
