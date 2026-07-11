@@ -431,6 +431,7 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 				rf.matchIndex[server] = matchedThrough
 				rf.nextIndex[server] = matchedThrough + 1
 			}
+			rf.advanceCommitIndex()
 		} else if rf.nextIndex[server] == response.prevLogIndex+1 && rf.nextIndex[server] > 1 {
 			// Retry from an earlier point on the next replication attempt.
 			rf.nextIndex[server]--
@@ -465,6 +466,7 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 			}
 			rf.sendAppendEntriesToPeer(i)
 		}
+		rf.advanceCommitIndex()
 		ev.reply <- reply
 	default:
 		panic("unexpected event kind")
@@ -594,6 +596,25 @@ func (rf *Raft) lastLogIndex() int {
 
 func (rf *Raft) lastLogTerm() int {
 	return rf.logs[rf.lastLogIndex()].Term
+}
+
+func (rf *Raft) advanceCommitIndex() {
+	for index := rf.lastLogIndex(); index > rf.commitIndex; index-- {
+		if rf.logs[index].Term != rf.currentTerm {
+			continue
+		}
+		replicated := 0
+		for _, matchIndex := range rf.matchIndex {
+			if matchIndex >= index {
+				replicated++
+			}
+		}
+		if replicated >= len(rf.peers)/2+1 {
+			rf.commitIndex = index
+			rf.applyCommittedEntries()
+			return
+		}
+	}
 }
 
 func (rf *Raft) applyCommittedEntries() {
