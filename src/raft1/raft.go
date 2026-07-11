@@ -57,7 +57,8 @@ type Raft struct {
 	matchIndex []int // for each peer/server, highest log entry known to be replicated (init = 0, monotonically increases)
 
 	// channel for raft event loop to consume from
-	events chan event
+	events  chan event
+	applyCh chan raftapi.ApplyMsg
 
 	// ticks related state - used for heartbeats and elections
 	tickCh           chan struct{}
@@ -345,19 +346,52 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 		}
 	case evAppendEntries:
 		args := ev.payload.(*AppendEntriesRequest)
-		var reply AppendEntriesReply
-		reply.Term = rf.currentTerm
+		reply := AppendEntriesReply{Term: rf.currentTerm}
 		if args.Term < rf.currentTerm {
 			ev.reply <- reply
 			return
 		}
 
-		if args.Term > rf.currentTerm || rf.state == Candidate {
+		if args.Term > rf.currentTerm || rf.state != Follower {
 			rf.becomeFollower(args.Term)
 		}
+		// A non-stale AppendEntries is evidence of a leader, even if the
+		// log consistency check below fails.
 		rf.electionElapsed = 0
+		reply.Term = rf.currentTerm
 
-		// todo: not handling log entry matching, conflicts, commit etc
+		// The log must contain the entry immediately before the new entries,
+		// with the same term.
+		if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.logs) ||
+			rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+			ev.reply <- reply
+			return
+		}
+
+		// Keep matching entries. At the first conflict, discard that entry
+		// and everything after it, then append the leader's remaining entries.
+		for i, entry := range args.Entries {
+			index := args.PrevLogIndex + 1 + i
+			if index < len(rf.logs) {
+				if rf.logs[index].Term == entry.Term {
+					continue
+				}
+				if index <= rf.commitIndex {
+					// A committed entry must never be overwritten.
+					ev.reply <- reply
+					return
+				}
+				rf.logs = rf.logs[:index]
+			}
+			rf.logs = append(rf.logs, args.Entries[i:]...)
+			break
+		}
+
+		if args.LeaderCommitIndex > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommitIndex, rf.lastLogIndex())
+			rf.applyCommittedEntries()
+		}
+
 		reply.Success = true
 		ev.reply <- reply
 	case evAppendEntriesReply:
@@ -484,6 +518,18 @@ func (rf *Raft) lastLogTerm() int {
 	return rf.logs[rf.lastLogIndex()].Term
 }
 
+func (rf *Raft) applyCommittedEntries() {
+	for rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		entry := rf.logs[rf.lastApplied]
+		rf.applyCh <- raftapi.ApplyMsg{
+			CommandValid: true,
+			Command:      entry.Command,
+			CommandIndex: rf.lastApplied,
+		}
+	}
+}
+
 func (rf *Raft) reset(term int) {
 	if rf.currentTerm != term {
 		rf.currentTerm = term
@@ -517,6 +563,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.state = Follower
