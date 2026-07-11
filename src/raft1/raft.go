@@ -178,6 +178,14 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+type appendEntriesReplyEvent struct {
+	server       int
+	requestTerm  int
+	prevLogIndex int
+	entriesCount int
+	reply        AppendEntriesReply
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
@@ -238,6 +246,16 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply 
 	return ok
 }
 
+type StartRequest struct {
+	Command any
+}
+
+type StartReply struct {
+	MaybeCommitIndex int
+	Term             int
+	IsLeader         bool
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -251,13 +269,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply 
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (3B).
-
-	return index, term, isLeader
+	ch := make(chan any)
+	rf.events <- event{
+		kind:    evStart,
+		payload: &StartRequest{Command: command},
+		reply:   ch,
+	}
+	reply := (<-ch).(*StartReply)
+	return reply.MaybeCommitIndex, reply.Term, reply.IsLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -395,12 +415,57 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 		reply.Success = true
 		ev.reply <- reply
 	case evAppendEntriesReply:
-		reply := ev.payload.(*AppendEntriesReply)
-		if reply.Term > rf.currentTerm {
-			rf.becomeFollower(reply.Term)
+		response := ev.payload.(*appendEntriesReplyEvent)
+		if response.reply.Term > rf.currentTerm {
+			rf.becomeFollower(response.reply.Term)
+			return
+		}
+		if rf.state != Leader || response.requestTerm != rf.currentTerm {
+			return
 		}
 
-		// todo: based on reply.Success, adjust nextIndex and matchIndex
+		server := response.server
+		if response.reply.Success {
+			matchedThrough := response.prevLogIndex + response.entriesCount
+			if matchedThrough > rf.matchIndex[server] {
+				rf.matchIndex[server] = matchedThrough
+				rf.nextIndex[server] = matchedThrough + 1
+			}
+		} else if rf.nextIndex[server] == response.prevLogIndex+1 && rf.nextIndex[server] > 1 {
+			// Retry from an earlier point on the next replication attempt.
+			rf.nextIndex[server]--
+		}
+	case evStart:
+		args := ev.payload.(*StartRequest)
+		if rf.state != Leader {
+			ev.reply <- &StartReply{
+				MaybeCommitIndex: -1,
+				Term:             rf.currentTerm,
+				IsLeader:         false,
+			}
+			return
+		}
+
+		logEntry := LogEntry{
+			Term:    rf.currentTerm,
+			Command: args.Command,
+		}
+		rf.logs = append(rf.logs, logEntry)
+		index := rf.lastLogIndex()
+		rf.matchIndex[rf.me] = index
+		reply := &StartReply{
+			MaybeCommitIndex: index,
+			Term:             rf.currentTerm,
+			IsLeader:         true,
+		}
+
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			rf.sendAppendEntriesToPeer(i)
+		}
+		ev.reply <- reply
 	default:
 		panic("unexpected event kind")
 	}
@@ -416,6 +481,12 @@ func (rf *Raft) becomeLeader() {
 	rf.state = Leader
 	DPrintf("server %d: becoming leader in term %d", rf.me, rf.currentTerm)
 	rf.reset(rf.currentTerm)
+	lastIndex := rf.lastLogIndex()
+	for i := range rf.peers {
+		rf.nextIndex[i] = lastIndex + 1
+		rf.matchIndex[i] = 0
+	}
+	rf.matchIndex[rf.me] = lastIndex
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -445,6 +516,23 @@ func (rf *Raft) buildHeartbeatArgs() AppendEntriesRequest {
 	}
 }
 
+func (rf *Raft) buildAppendEntriesReq(server int) AppendEntriesRequest {
+	next := rf.nextIndex[server]
+	if next < 1 {
+		next = 1
+	}
+	prevIndex := next - 1
+	entries := append([]LogEntry(nil), rf.logs[next:]...)
+	return AppendEntriesRequest{
+		Term:              rf.currentTerm,
+		LeaderID:          rf.me,
+		PrevLogIndex:      prevIndex,
+		PrevLogTerm:       rf.logs[prevIndex].Term,
+		Entries:           entries,
+		LeaderCommitIndex: rf.commitIndex,
+	}
+}
+
 func (rf *Raft) handleTick() {
 	if rf.state == Leader {
 		rf.heartbeatElapsed++
@@ -457,17 +545,7 @@ func (rf *Raft) handleTick() {
 				if i == rf.me {
 					continue
 				}
-				args := rf.buildHeartbeatArgs()
-				go func(server int, args AppendEntriesRequest) {
-					var reply AppendEntriesReply
-					ok := rf.sendAppendEntries(server, &args, &reply)
-					if ok {
-						rf.events <- event{
-							kind:    evAppendEntriesReply,
-							payload: &reply,
-						}
-					}
-				}(i, args)
+				rf.sendAppendEntriesToPeer(i)
 			}
 		}
 		return
@@ -530,6 +608,26 @@ func (rf *Raft) applyCommittedEntries() {
 	}
 }
 
+func (rf *Raft) sendAppendEntriesToPeer(server int) {
+	args := rf.buildAppendEntriesReq(server)
+	response := &appendEntriesReplyEvent{
+		server:       server,
+		requestTerm:  args.Term,
+		prevLogIndex: args.PrevLogIndex,
+		entriesCount: len(args.Entries),
+	}
+	go func() {
+		var reply AppendEntriesReply
+		if rf.sendAppendEntries(server, &args, &reply) {
+			response.reply = reply
+			rf.events <- event{
+				kind:    evAppendEntriesReply,
+				payload: response,
+			}
+		}
+	}()
+}
+
 func (rf *Raft) reset(term int) {
 	if rf.currentTerm != term {
 		rf.currentTerm = term
@@ -578,8 +676,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
-	rf.nextIndex = nil
-	rf.matchIndex = nil
+	rf.nextIndex = make([]int, len(peers))
+	for i := range len(peers) {
+		rf.nextIndex[i] = rf.lastLogIndex() + 1
+	}
+	rf.matchIndex = make([]int, len(peers))
 
 	rf.tickDuration = time.Millisecond * 50
 	rf.heartbeatTimeout = 1
