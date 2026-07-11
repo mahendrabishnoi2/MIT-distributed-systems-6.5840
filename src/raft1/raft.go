@@ -174,8 +174,10 @@ type AppendEntriesRequest struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 type appendEntriesReplyEvent struct {
@@ -366,7 +368,7 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 		}
 	case evAppendEntries:
 		args := ev.payload.(*AppendEntriesRequest)
-		reply := AppendEntriesReply{Term: rf.currentTerm}
+		reply := AppendEntriesReply{Term: rf.currentTerm, ConflictTerm: -1}
 		if args.Term < rf.currentTerm {
 			ev.reply <- reply
 			return
@@ -383,7 +385,8 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 		// The log must contain the entry immediately before the new entries,
 		// with the same term.
 		if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.logs) ||
-			rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+			(args.PrevLogIndex >= 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
+			rf.setConflictHint(&reply, args.PrevLogIndex)
 			ev.reply <- reply
 			return
 		}
@@ -398,6 +401,7 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 				}
 				if index <= rf.commitIndex {
 					// A committed entry must never be overwritten.
+					rf.setConflictHint(&reply, index)
 					ev.reply <- reply
 					return
 				}
@@ -433,8 +437,24 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 			}
 			rf.advanceCommitIndex()
 		} else if rf.nextIndex[server] == response.prevLogIndex+1 && rf.nextIndex[server] > 1 {
-			// Retry from an earlier point on the next replication attempt.
-			rf.nextIndex[server]--
+			currentNext := rf.nextIndex[server]
+			next := response.reply.ConflictIndex
+			if response.reply.ConflictTerm >= 0 {
+				for index := rf.lastLogIndex(); index >= 0; index-- {
+					if rf.logs[index].Term == response.reply.ConflictTerm {
+						next = index + 1
+						break
+					}
+				}
+			}
+			if next < 1 {
+				next = 1
+			}
+			if next >= currentNext {
+				next = currentNext - 1
+			}
+			rf.nextIndex[server] = next
+			rf.sendAppendEntriesToPeer(server)
 		}
 	case evStart:
 		args := ev.payload.(*StartRequest)
@@ -596,6 +616,27 @@ func (rf *Raft) lastLogIndex() int {
 
 func (rf *Raft) lastLogTerm() int {
 	return rf.logs[rf.lastLogIndex()].Term
+}
+
+func (rf *Raft) setConflictHint(reply *AppendEntriesReply, index int) {
+	if index < 0 {
+		reply.ConflictIndex = 0
+		reply.ConflictTerm = -1
+		return
+	}
+	if index >= len(rf.logs) {
+		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictTerm = -1
+		return
+	}
+
+	term := rf.logs[index].Term
+	firstIndex := index
+	for firstIndex > 0 && rf.logs[firstIndex-1].Term == term {
+		firstIndex--
+	}
+	reply.ConflictIndex = firstIndex
+	reply.ConflictTerm = term
 }
 
 func (rf *Raft) advanceCommitIndex() {
