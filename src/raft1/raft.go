@@ -337,9 +337,7 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 		if args.Term > rf.currentTerm {
 			// Seeing a higher term is not a reason to reset the election timer
 			// (only granting a vote or hearing from the leader is).
-			elapsed := rf.electionElapsed
 			rf.becomeFollower(args.Term)
-			rf.electionElapsed = elapsed
 		}
 		reply.Term = rf.currentTerm
 
@@ -353,7 +351,7 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 		if rf.votedFor == args.CandidateID || rf.votedFor == -1 {
 			rf.votedFor = args.CandidateID
 			reply.VoteGranted = true
-			rf.electionElapsed = 0 // granting a vote resets the election timer
+			rf.resetElectionTimer() // granting a vote resets the election timer
 		}
 
 		ev.reply <- reply
@@ -386,7 +384,7 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 		}
 		// A non-stale AppendEntries is evidence of a leader, even if the
 		// log consistency check below fails.
-		rf.electionElapsed = 0
+		rf.resetElectionTimer()
 		reply.Term = rf.currentTerm
 
 		// The log must contain the entry immediately before the new entries,
@@ -510,6 +508,7 @@ func (rf *Raft) becomeLeader() {
 	rf.state = Leader
 	DPrintf("server %d: becoming leader in term %d", rf.me, rf.currentTerm)
 	rf.reset(rf.currentTerm)
+	rf.heartbeatElapsed = 0
 	lastIndex := rf.lastLogIndex()
 	for i := range rf.peers {
 		rf.nextIndex[i] = lastIndex + 1
@@ -523,6 +522,7 @@ func (rf *Raft) becomeCandidate() {
 	DPrintf("server %d: becoming candidate in term %d", rf.me, rf.currentTerm+1)
 	rf.reset(rf.currentTerm + 1)
 	rf.votedFor = rf.me
+	rf.resetElectionTimer() // starting an election restarts the timer
 }
 
 func (rf *Raft) isAtLeastAsUpToDate(lastLogTerm, lastLogIndex int) bool {
@@ -697,18 +697,22 @@ func (rf *Raft) sendAppendEntriesToPeer(server int) {
 	}()
 }
 
+// reset updates term/vote
 func (rf *Raft) reset(term int) {
 	if rf.currentTerm != term {
 		rf.currentTerm = term
 		rf.votedFor = -1
 	}
-
-	rf.heartbeatElapsed = 0
-	rf.electionElapsed = 0
-
 	rf.votes = 0
-	rf.randomizeElectionTimeout()
 	// todo: reset nextIndex and matchIndex as well
+}
+
+// resetElectionTimer restarts the election countdown with a fresh random
+// timeout. Call only when: starting an election, granting a vote, or
+// receiving AppendEntries from the current leader.
+func (rf *Raft) resetElectionTimer() {
+	rf.electionElapsed = 0
+	rf.randomizeElectionTimeout()
 }
 
 func (rf *Raft) randomizeElectionTimeout() {
