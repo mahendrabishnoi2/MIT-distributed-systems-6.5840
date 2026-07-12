@@ -331,22 +331,29 @@ func (rf *Raft) handleEvent(ev event) { // this is basically Step(), central ent
 	case evRequestVote:
 		args := ev.payload.(*RequestVoteArgs)
 		reply := RequestVoteReply{}
+
+		// Figure 2 (all servers): a higher term in any RPC means adopt it and
+		// step down, even if we end up denying the vote.
+		if args.Term > rf.currentTerm {
+			// Seeing a higher term is not a reason to reset the election timer
+			// (only granting a vote or hearing from the leader is).
+			elapsed := rf.electionElapsed
+			rf.becomeFollower(args.Term)
+			rf.electionElapsed = elapsed
+		}
+		reply.Term = rf.currentTerm
+
 		// if my term > requestor's term, no vote
 		// if requestor's log is not as up to date as mine, no vote (5.4.1 Election Restriction)
 		if args.Term < rf.currentTerm || !rf.isAtLeastAsUpToDate(args.LastLogTerm, args.LastLogIndex) {
-			reply.Term = rf.currentTerm
 			ev.reply <- reply
 			return
 		}
 
-		if args.Term > rf.currentTerm {
-			rf.becomeFollower(args.Term)
-		}
-
-		reply.Term = rf.currentTerm
 		if rf.votedFor == args.CandidateID || rf.votedFor == -1 {
 			rf.votedFor = args.CandidateID
 			reply.VoteGranted = true
+			rf.electionElapsed = 0 // granting a vote resets the election timer
 		}
 
 		ev.reply <- reply
